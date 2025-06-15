@@ -2,13 +2,13 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"archiver/compressor"
 	"archiver/compressor/algo"
@@ -26,6 +26,7 @@ func main() {
 
 	input := widget.NewMultiLineEntry()
 	input.SetPlaceHolder("Выберите файлы и директории")
+	input.TextStyle.Bold = true
 	input.Disable()
 
 	algoName := widget.NewSelect([]string{"auto", "gzip", "brotli", "lz4", "zlib"}, nil)
@@ -59,7 +60,7 @@ func main() {
 				return
 			}
 			defer c.Close()
-			input.SetText(c.URI().Path())
+			input.SetText(c.URI().String())
 		}, w)
 	})
 
@@ -95,9 +96,49 @@ func main() {
 			return
 		}
 
+		const (
+			batchSize  = 20  // Количество файлов в одном обновлении
+			maxResults = 500 // Максимальное количество хранимых результатов
+		)
+		var (
+			batchBuffer    []string
+			batchMutex     sync.Mutex
+			processedFiles []string
+		)
+
+		// Создаем окно результатов заранее
+		resultList := widget.NewList(
+			func() int { return len(processedFiles) },
+			func() fyne.CanvasObject { return widget.NewLabel("") },
+			func(i widget.ListItemID, o fyne.CanvasObject) {
+				o.(*widget.Label).SetText(processedFiles[i])
+			},
+		)
+		scrollContainer := container.NewScroll(resultList)
+
+		action := "Сжатие"
+		if !isCompress {
+			action = "Восстановление"
+		}
+
 		progressBar.Show()
+		progressBar.Refresh()
+		progressContainer := container.NewVBox( // Явно создаем контейнер для прогресс-бара
+			widget.NewLabel(fmt.Sprintf("Обработка %d файлов...", len(files))),
+			progressBar,
+		)
+		progressContainer.Refresh() // Важно: обновляем контейнер
+
+		progressDialog := dialog.NewCustom(
+			fmt.Sprintf("%s в процессе...", action),
+			"Закрыть",
+			progressContainer,
+			w,
+		)
+		progressDialog.Show()
 		progressBar.Max = float64(len(files))
 		progressBar.SetValue(0)
+		progressDialog.Show()
 
 		selectedAlgo := algoName.Selected
 		processor := compressor.NewProcessor(compressors, selectedAlgo, workers, false)
@@ -105,11 +146,76 @@ func main() {
 		var wg sync.WaitGroup
 		sem := make(chan struct{}, workers)
 
-		// Создаем канал для сбора результатов
-		results := make(chan struct {
-			file   string
-			result *compressor.CompressionResult
-		}, len(files))
+		// Канал для обновления UI в реальном времени
+		updateUI := make(chan string, 100)
+
+		// Горутина для обновления UI
+		go func() {
+			go func() {
+				ticker := time.NewTicker(100 * time.Millisecond)
+				defer ticker.Stop()
+
+				for {
+					select {
+					case <-ticker.C:
+						batchMutex.Lock()
+						if len(batchBuffer) > 0 {
+							updateUI <- strings.Join(batchBuffer, "")
+							batchBuffer = batchBuffer[:0]
+						}
+						batchMutex.Unlock()
+					case msg, ok := <-updateUI:
+						if !ok {
+							return
+						}
+						batchMutex.Lock()
+						batchBuffer = append(batchBuffer, msg)
+						if len(batchBuffer) >= batchSize {
+							updateUI <- strings.Join(batchBuffer, "")
+							batchBuffer = batchBuffer[:0]
+						}
+						batchMutex.Unlock()
+					}
+				}
+			}()
+
+			for update := range updateUI {
+				processedFiles = append(processedFiles, update)
+
+				// Ограничиваем количество хранимых результатов
+				if len(processedFiles) > maxResults {
+					processedFiles = processedFiles[len(processedFiles)-maxResults:]
+				}
+
+				resultList.Refresh()
+				scrollContainer.ScrollToBottom()
+
+				// Даем время на обработку событий UI
+				if len(processedFiles)%50 == 0 {
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+
+			progressDialog.Hide()
+			if isCompress {
+				// Для сжатия показываем детализированные результаты
+				resultDialog := dialog.NewCustom(
+					fmt.Sprintf("%s завершено!", action),
+					"Закрыть",
+					scrollContainer,
+					w,
+				)
+				resultDialog.Resize(fyne.NewSize(400, 400))
+				resultDialog.Show()
+			} else {
+				// Для восстановления просто показываем уведомление
+				dialog.ShowInformation(
+					"Восстановление завершено",
+					"Файлы успешно восстановлены",
+					w,
+				)
+			}
+		}()
 
 		for i, file := range files {
 			wg.Add(1)
@@ -119,6 +225,10 @@ func main() {
 				defer wg.Done()
 				defer func() { <-sem }()
 
+				if idx%10 == 0 {
+					time.Sleep(5 * time.Millisecond)
+				}
+
 				var result *compressor.CompressionResult
 				if isCompress {
 					result = processor.ProcessFile(f, "")
@@ -126,56 +236,37 @@ func main() {
 					result = processor.DecompressFile(f)
 				}
 
-				if result.Error != nil {
-					log.Printf("Ошибка при обработке %s: %v", f, result.Error)
-				}
-
-				results <- struct {
-					file   string
-					result *compressor.CompressionResult
-				}{f, result}
-
+				a.SendNotification(fyne.NewNotification("", ""))
 				progressBar.SetValue(float64(idx + 1))
+				progressBar.Refresh()
+
+				if isCompress {
+					var msg string
+					if result.Error != nil {
+						msg = fmt.Sprintf("%s: ошибка - %v\n", filepath.Base(f), result.Error)
+					} else {
+						originalSizeMB := float64(result.OriginalSize) / 1024 / 1024
+						compressedSizeMB := float64(result.CompressedSize) / 1024 / 1024
+
+						if originalSizeMB >= 0.05 || compressedSizeMB >= 0.05 {
+							msg = fmt.Sprintf("%s: %.1f%% (%.1f MB -> %.1f MB)\n",
+								filepath.Base(f),
+								result.CompressionRatio,
+								originalSizeMB,
+								compressedSizeMB)
+						}
+					}
+
+					if msg != "" {
+						updateUI <- msg
+					}
+				}
 			}(file, i)
 		}
 
 		go func() {
 			wg.Wait()
-			close(results)
-			progressBar.Hide()
-
-			// Собираем результаты
-			var successCount int
-			var details strings.Builder
-			for r := range results {
-				if r.result.Error == nil && r.result.OriginalSize > 0 {
-					successCount++
-					details.WriteString(fmt.Sprintf("%s: %.1f%% (%.1f MB -> %.1f MB)\n",
-						filepath.Base(r.file),
-						r.result.CompressionRatio,
-						float64(r.result.OriginalSize)/1024/1024,
-						float64(r.result.CompressedSize)/1024/1024))
-				} else if r.result.Error != nil {
-					details.WriteString(fmt.Sprintf("%s: ошибка - %v\n",
-						filepath.Base(r.file),
-						r.result.Error))
-				}
-			}
-
-			action := "Сжатие"
-			if !isCompress {
-				action = "Восстановление"
-			}
-
-			var message string
-			if successCount == 0 {
-				message = "Ошибка: не найдено файлов для обработки"
-			} else {
-				message = fmt.Sprintf("Успешно обработано %d файлов\n\nДетали:\n%s",
-					successCount, details.String())
-			}
-
-			dialog.ShowInformation(fmt.Sprintf("%s завершено!", action), message, w)
+			close(updateUI)
 		}()
 	}
 
@@ -195,7 +286,6 @@ func main() {
 		),
 		selectFilesButton,
 		selectFolderButton,
-		progressBar,
 		container.NewHBox(compressButton, decompressButton),
 	))
 
