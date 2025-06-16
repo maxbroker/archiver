@@ -32,13 +32,20 @@ func main() {
 	algoName := widget.NewSelect([]string{"auto", "gzip", "brotli", "lz4", "zlib"}, nil)
 	algoName.SetSelected("auto")
 
-	// Создаем список доступных потоков
+	//Ограничение, чтобы оставить место работы для операционной системы
+	cpuNum := runtime.NumCPU()
+	if cpuNum <= 4 {
+		cpuNum = 1
+	} else {
+		cpuNum = cpuNum - 4
+	}
+
 	var threadOptions []string
-	for i := 1; i <= runtime.NumCPU(); i++ {
+	for i := 1; i <= cpuNum; i++ {
 		threadOptions = append(threadOptions, fmt.Sprintf("%d", i))
 	}
 	concurrency := widget.NewSelect(threadOptions, nil)
-	concurrency.SetSelected(fmt.Sprintf("%d", runtime.NumCPU()))
+	concurrency.SetSelected(fmt.Sprintf("%d", cpuNum))
 
 	progressBar := widget.NewProgressBar()
 	progressBar.Hide()
@@ -97,8 +104,8 @@ func main() {
 		}
 
 		const (
-			batchSize  = 20  // Количество файлов в одном обновлении
-			maxResults = 500 // Максимальное количество хранимых результатов
+			batchSize  = 20
+			maxResults = 500
 		)
 		var (
 			batchBuffer    []string
@@ -106,7 +113,6 @@ func main() {
 			processedFiles []string
 		)
 
-		// Создаем окно результатов заранее
 		resultList := widget.NewList(
 			func() int { return len(processedFiles) },
 			func() fyne.CanvasObject { return widget.NewLabel("") },
@@ -123,11 +129,11 @@ func main() {
 
 		progressBar.Show()
 		progressBar.Refresh()
-		progressContainer := container.NewVBox( // Явно создаем контейнер для прогресс-бара
+		progressContainer := container.NewVBox(
 			widget.NewLabel(fmt.Sprintf("Обработка %d файлов...", len(files))),
 			progressBar,
 		)
-		progressContainer.Refresh() // Важно: обновляем контейнер
+		progressContainer.Refresh()
 
 		progressDialog := dialog.NewCustom(
 			fmt.Sprintf("%s в процессе...", action),
@@ -146,7 +152,6 @@ func main() {
 		var wg sync.WaitGroup
 		sem := make(chan struct{}, workers)
 
-		// Канал для обновления UI в реальном времени
 		updateUI := make(chan string, 100)
 
 		// Горутина для обновления UI
@@ -182,7 +187,6 @@ func main() {
 			for update := range updateUI {
 				processedFiles = append(processedFiles, update)
 
-				// Ограничиваем количество хранимых результатов
 				if len(processedFiles) > maxResults {
 					processedFiles = processedFiles[len(processedFiles)-maxResults:]
 				}
@@ -190,7 +194,6 @@ func main() {
 				resultList.Refresh()
 				scrollContainer.ScrollToBottom()
 
-				// Даем время на обработку событий UI
 				if len(processedFiles)%50 == 0 {
 					time.Sleep(10 * time.Millisecond)
 				}
@@ -198,7 +201,6 @@ func main() {
 
 			progressDialog.Hide()
 			if isCompress {
-				// Для сжатия показываем детализированные результаты
 				resultDialog := dialog.NewCustom(
 					fmt.Sprintf("%s завершено!", action),
 					"Закрыть",
@@ -298,7 +300,22 @@ func getFiles(input string) ([]string, error) {
 	paths := strings.Split(input, ",")
 	for _, path := range paths {
 		path = strings.TrimSpace(path)
-		err := filepath.Walk(path, func(filePath string, info os.FileInfo, err error) error {
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, fmt.Errorf("ошибка доступа к пути %s: %v", path, err)
+		}
+
+		if info.IsDir() {
+			entries, err := os.ReadDir(path)
+			if err != nil {
+				return nil, fmt.Errorf("ошибка чтения директории %s: %v", path, err)
+			}
+			if len(entries) == 0 {
+				return nil, fmt.Errorf("директория %s пуста", path)
+			}
+		}
+
+		err = filepath.Walk(path, func(filePath string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
@@ -311,5 +328,10 @@ func getFiles(input string) ([]string, error) {
 			return nil, err
 		}
 	}
+
+	if len(files) == 0 {
+		return nil, fmt.Errorf("не найдено файлов для обработки")
+	}
+
 	return files, nil
 }
